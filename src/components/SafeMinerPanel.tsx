@@ -150,10 +150,16 @@ function PasteIcon({ className }: { className?: string }) {
 }
 
 export default function SafeMinerPanel() {
-  const [ownersText, setOwnersText] = useState('');
-  const [threshold, setThreshold] = useState(1);
+  // Read URL parameters for pre-filling (e.g. from CLI mine.ts deploy links)
+  const urlParams = typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : null;
+  const urlOwners = urlParams?.get('owners') ?? '';
+  const urlThreshold = urlParams?.get('threshold');
+  const urlSalt = urlParams?.get('salt') ?? '';
+
+  const [ownersText, setOwnersText] = useState(urlOwners ? urlOwners.split(',').join('\n') : '');
+  const [threshold, setThreshold] = useState(urlThreshold ? parseInt(urlThreshold, 10) || 1 : 1);
   const [selectedChainId, setSelectedChainId] = useState(8453); // Default to Base
-  const [saltInput, setSaltInput] = useState('');
+  const [saltInput, setSaltInput] = useState(urlSalt);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [copyFeedback, setCopyFeedback] = useState(false);
   const [walletState, setWalletState] = useState<WalletState>({

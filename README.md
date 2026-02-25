@@ -155,6 +155,7 @@ prettysafe/
 │   ├── gnosis-create2.wgsl    # Safe address mining
 │   └── keccak.wgsl            # Keccak-256 implementation
 ├── 🔧 CLI Tools
+│   ├── mine.ts                # Headless CLI miner
 │   ├── benchmark.ts           # Performance testing
 │   └── test.ts                # Validation suite
 └── 📋 Config files
@@ -163,6 +164,32 @@ prettysafe/
 ---
 
 ## 🛠️ CLI Tools
+
+### Headless Miner
+
+Mine vanity addresses from the command line using `bun-webgpu` (no browser needed). Results are saved to `./tmp/<date>-compute.json` and deploy links are printed for each new best.
+
+```bash
+bun run mine -- --owners 0xABC...,0xDEF... --threshold 1
+```
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--owners` | Comma-separated owner addresses | (required) |
+| `--threshold` | Safe multisig threshold | `1` |
+| `--url` | Base URL for deploy links | `https://prettysafe.xyz` |
+
+**Local development:** When running the web app locally, pass `--url` so deploy links open your dev server:
+
+```bash
+# Terminal 1: start the web app
+bun run dev
+
+# Terminal 2: mine with deploy links pointing to localhost
+bun run mine -- --owners 0xABC... --url http://localhost:5173
+```
+
+Deploy links include all parameters needed to deploy: `http://localhost:5173?owners=0xABC...&threshold=1&salt=0x2a`
 
 ### Benchmark
 

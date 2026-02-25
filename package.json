@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "benchmark": "bun run benchmark.ts",
     "test": "bun run test.ts",
-    "test:derivation": "npx tsx src/lib/test-derivation.ts"
+    "test:derivation": "npx tsx src/lib/test-derivation.ts",
+    "mine": "bun run mine.ts"
   },
   "dependencies": {
     "@metamask/jazzicon": "^2.0.0",
