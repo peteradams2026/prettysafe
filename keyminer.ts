@@ -7,6 +7,12 @@
  * Optimization: CPU precomputes base_point and a 3-level table of G multiples.
  * GPU threads do at most 3 EC additions + 1 mod_inv instead of full scalar multiply.
  *
+ * Shader is assembled by concatenating modular WGSL files:
+ *   wgsl/secp256k1-field.wgsl  →  u256 + mod arithmetic
+ *   wgsl/keccak256.wgsl        →  Keccak-256 hash
+ *   wgsl/secp256k1-ec.wgsl     →  EC point operations
+ *   keyminer.wgsl              →  dispatch logic + buffers
+ *
  * Usage:
  *   bun run keyminer.ts [--start-key 0x...] [--leading-zeros 8] [--no-resume]
  *
@@ -34,8 +40,6 @@ const targetZeros = parseInt(values["leading-zeros"] ?? "8");
 const noResume = values["no-resume"] ?? false;
 
 // Default start key: random 16-byte prefix in the upper half, lower 16 bytes = 0.
-// This gives each run a unique 2^128 key range, enabling parallelization and
-// ensuring reruns don't repeat the same key space.
 let startKeyHex: string;
 if (values["start-key"]) {
   startKeyHex = values["start-key"];
@@ -49,7 +53,6 @@ if (values["start-key"]) {
 
 // ── Bignum helpers ────────────────────────────────────────────────────
 
-// Parse 256-bit hex → 8 little-endian u32 limbs
 function hexToLimbs(hex: string): Uint32Array {
   const clean = hex.replace("0x", "").padStart(64, "0");
   const limbs = new Uint32Array(8);
@@ -84,15 +87,13 @@ function bigintToHex64(n: bigint): string {
 
 // ── EC point precomputation using ethers ──────────────────────────────
 
-// Returns affine point (x, y) as little-endian u32 limbs, or null for identity
 function computeECPoint(scalar: bigint): { x: Uint32Array; y: Uint32Array } | null {
   if (scalar === 0n) return null;
-  // Ensure scalar is within secp256k1 order
   const n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141n;
   const s = ((scalar % n) + n) % n;
   if (s === 0n) return null;
   const sk = new SigningKey(bigintToHex64(s));
-  const pub = sk.publicKey; // "0x04" + 64 hex x + 64 hex y
+  const pub = sk.publicKey;
   return {
     x: hexToLimbs("0x" + pub.slice(4, 68)),
     y: hexToLimbs("0x" + pub.slice(68, 132)),
@@ -192,7 +193,7 @@ function expectedHashesForNZeros(n: number): number {
 }
 
 // ── WebGPU init ───────────────────────────────────────────────────────
-console.log(`\n⚠️  WARNING: This tool displays private keys in the terminal.`);
+console.log(`\nWARNING: This tool displays private keys in the terminal.`);
 console.log(`   Anyone with the private key controls the corresponding wallet.\n`);
 console.log(`Mining vanity EVM addresses via private key iteration`);
 console.log(`  Start key: ${startKeyHex}`);
@@ -200,6 +201,7 @@ console.log(`  Target: ${targetZeros} leading zeros`);
 console.log(`  Output: ${outPath}`);
 console.log();
 
+const startKeyBigInt = BigInt(startKeyHex);
 let adapter: GPUAdapter | null = null;
 try {
   const mod = await import("bun-webgpu");
@@ -212,37 +214,75 @@ try {
     adapter = await gpu.requestAdapter();
   }
 } catch (e) {
-  console.error("Could not load bun-webgpu:", e);
-  process.exit(1);
+  throw new Error(`Could not load bun-webgpu: ${e}`);
 }
 
 if (!adapter) {
-  console.error("No WebGPU adapter found.");
-  process.exit(1);
+  throw new Error("No WebGPU adapter found.");
 }
 
 const device = await adapter.requestDevice();
 console.log(`GPU: ${adapter.info.vendor} ${adapter.info.architecture}`);
 
-// ── Precompute EC table ──────────────────────────────────────────────
-// 3-level table of G multiples for fast GPU lookups:
-//   Table A [0..63]:      i * G           (local thread offset)
-//   Table B [64..1087]:   i * 64 * G      (workgroup x offset)
-//   Table C [1088..1103]: i * 65536 * G   (workgroup y offset)
-// Total: 1104 affine points, each 16 u32s = 70,656 bytes
+async function assertWebGpuQueueWriteWorks(device: GPUDevice) {
+  const size = 16;
+  const src = device.createBuffer({
+    size,
+    usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+  });
+  const dst = device.createBuffer({
+    size,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
 
+  const pattern = new Uint32Array([0x11223344, 0xaabbccdd, 0xdeadbeef, 0x01020304]);
+  device.queue.writeBuffer(src, 0, pattern);
+
+  const encoder = device.createCommandEncoder();
+  encoder.copyBufferToBuffer(src, 0, dst, 0, size);
+  device.queue.submit([encoder.finish()]);
+  await device.queue.onSubmittedWorkDone();
+
+  await dst.mapAsync(GPUMapMode.READ);
+  const out = new Uint32Array(dst.getMappedRange().slice(0));
+  dst.unmap();
+
+  const ok =
+    out.length === pattern.length &&
+    out[0] === pattern[0] &&
+    out[1] === pattern[1] &&
+    out[2] === pattern[2] &&
+    out[3] === pattern[3];
+
+  if (!ok) {
+    throw new Error(
+      `WebGPU queue.writeBuffer sanity check failed (got ${Array.from(out).map((x) => "0x" + x.toString(16)).join(", ")})`
+    );
+  }
+}
+
+await assertWebGpuQueueWriteWorks(device);
+
+// ── Dispatch setup ─────────────────────────────────────────────────────
+const WORKGROUP_SIZE = 64;
+const TABLE_A_SIZE = 64;
+const TABLE_B_SIZE = 1024;
+const TABLE_C_SIZE = 16;
+const DISPATCH_X = TABLE_B_SIZE;
+const DISPATCH_Y = TABLE_C_SIZE;
+const ITEMS_PER_DISPATCH = WORKGROUP_SIZE * DISPATCH_X * DISPATCH_Y; // 1,048,576
+
+// ── Precompute EC table ────────────────────────────────────────────
 console.log("Precomputing EC point table...");
-const TABLE_A_SIZE = 64;    // matches workgroup_size
-const TABLE_B_SIZE = 1024;  // matches DISPATCH_X
-const TABLE_C_SIZE = 16;    // matches DISPATCH_Y
-const TABLE_TOTAL = TABLE_A_SIZE + TABLE_B_SIZE + TABLE_C_SIZE; // 1104
+const TABLE_TOTAL = TABLE_A_SIZE + TABLE_B_SIZE + TABLE_C_SIZE;
+const tableData = new Uint32Array(TABLE_TOTAL * 16);
 
-const tableData = new Uint32Array(TABLE_TOTAL * 16); // 16 u32s per point
-
-function writePointToTable(idx: number, pt: { x: Uint32Array; y: Uint32Array } | null) {
+function writePointToTable(
+  idx: number,
+  pt: { x: Uint32Array; y: Uint32Array } | null
+) {
   const base = idx * 16;
   if (pt === null) {
-    // Identity: all zeros
     for (let i = 0; i < 16; i++) tableData[base + i] = 0;
   } else {
     for (let i = 0; i < 8; i++) tableData[base + i] = pt.x[i];
@@ -250,30 +290,34 @@ function writePointToTable(idx: number, pt: { x: Uint32Array; y: Uint32Array } |
   }
 }
 
-// Table A: i * G for i = 0..63
 for (let i = 0; i < TABLE_A_SIZE; i++) {
   writePointToTable(i, computeECPoint(BigInt(i)));
 }
-
-// Table B: (i * 64) * G for i = 0..1023
 for (let i = 0; i < TABLE_B_SIZE; i++) {
   writePointToTable(TABLE_A_SIZE + i, computeECPoint(BigInt(i) * 64n));
 }
-
-// Table C: (i * 65536) * G for i = 0..15
 for (let i = 0; i < TABLE_C_SIZE; i++) {
-  writePointToTable(TABLE_A_SIZE + TABLE_B_SIZE + i, computeECPoint(BigInt(i) * 65536n));
+  writePointToTable(
+    TABLE_A_SIZE + TABLE_B_SIZE + i,
+    computeECPoint(BigInt(i) * 65536n)
+  );
 }
 
-console.log(`  ${TABLE_TOTAL} points precomputed (${(tableData.byteLength / 1024).toFixed(0)} KB)`);
+console.log(
+  `  ${TABLE_TOTAL} points precomputed (${(tableData.byteLength / 1024).toFixed(0)} KB)`
+);
 
-// ── Shader + buffers ──────────────────────────────────────────────────
-const shaderCode = await Bun.file(
-  join(import.meta.dir, "keyminer.wgsl")
-).text();
+// ── Shader assembly: concatenate WGSL modules ──────────────────────
+const shaderCode = [
+  await Bun.file(join(import.meta.dir, "wgsl", "secp256k1-field.wgsl")).text(),
+  await Bun.file(join(import.meta.dir, "wgsl", "keccak256.wgsl")).text(),
+  await Bun.file(join(import.meta.dir, "wgsl", "secp256k1-ec.wgsl")).text(),
+  await Bun.file(join(import.meta.dir, "keyminer.wgsl")).text(),
+].join("\n");
+
 const shaderModule = device.createShaderModule({ code: shaderCode });
 
-// Params: 6 vec4<u32> = 96 bytes (base_x, base_y, base_scalar)
+// Params: 6 vec4<u32> = 96 bytes
 const PARAMS_SIZE = 96;
 const paramsBuffer = device.createBuffer({
   size: PARAMS_SIZE,
@@ -284,8 +328,7 @@ const paramsBuffer = device.createBuffer({
 const RESULTS_SIZE = 56;
 const resultsBuffer = device.createBuffer({
   size: RESULTS_SIZE,
-  usage:
-    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
 });
 
 const readbackBuffer = device.createBuffer({
@@ -293,12 +336,24 @@ const readbackBuffer = device.createBuffer({
   usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
 });
 
-// EC table buffer (storage, read-only)
+// EC table buffer
 const tableBuffer = device.createBuffer({
   size: tableData.byteLength,
   usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
 });
 device.queue.writeBuffer(tableBuffer, 0, tableData);
+
+// Debug buffer: thread 0 writes pubkey(16) + hash(8) + key(8) = 32 u32s = 128 bytes
+const DEBUG_SIZE = 32 * 4;
+const debugBuffer = device.createBuffer({
+  size: DEBUG_SIZE,
+  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+});
+
+const debugReadbackBuffer = device.createBuffer({
+  size: DEBUG_SIZE,
+  usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+});
 
 const pipeline = device.createComputePipeline({
   layout: "auto",
@@ -311,38 +366,30 @@ const bindGroup = device.createBindGroup({
     { binding: 0, resource: { buffer: paramsBuffer } },
     { binding: 1, resource: { buffer: resultsBuffer } },
     { binding: 2, resource: { buffer: tableBuffer } },
+    { binding: 3, resource: { buffer: debugBuffer } },
   ],
 });
-
-// ── GPU dispatch ──────────────────────────────────────────────────────
-const WORKGROUP_SIZE = 64;
-const DISPATCH_X = TABLE_B_SIZE;  // 1024
-const DISPATCH_Y = TABLE_C_SIZE;  // 16
-const ITEMS_PER_DISPATCH = WORKGROUP_SIZE * DISPATCH_X * DISPATCH_Y; // 1,048,576
-
-const startKeyBigInt = BigInt(startKeyHex);
 
 function writeGpuBest() {
   const initResults = new Uint32Array(14);
   initResults.fill(0xffffffff);
   initResults[13] = 0; // found = 0
   device.queue.writeBuffer(resultsBuffer, 0, initResults);
+  // Clear debug buffer
+  device.queue.writeBuffer(debugBuffer, 0, new Uint32Array(32));
 }
 
-async function runOneDispatch(offset: number): Promise<Uint32Array> {
+const runOneDispatch = async (offset: number): Promise<{ results: Uint32Array; debug: Uint32Array }> => {
   writeGpuBest();
 
-  // CPU computes base_point = (startKey + offset) * G
   const baseScalar = startKeyBigInt + BigInt(offset);
   const basePoint = computeECPoint(baseScalar);
 
-  // Write params: base_x (8), base_y (8), base_scalar (8) = 24 u32s = 96 bytes
   const paramsData = new Uint32Array(24);
   if (basePoint) {
     for (let i = 0; i < 8; i++) paramsData[i] = basePoint.x[i];
     for (let i = 0; i < 8; i++) paramsData[8 + i] = basePoint.y[i];
   }
-  // base_scalar
   const scalarLimbs = hexToLimbs(bigintToHex64(baseScalar));
   for (let i = 0; i < 8; i++) paramsData[16 + i] = scalarLimbs[i];
   device.queue.writeBuffer(paramsBuffer, 0, paramsData);
@@ -353,23 +400,21 @@ async function runOneDispatch(offset: number): Promise<Uint32Array> {
   pass.setBindGroup(0, bindGroup);
   pass.dispatchWorkgroups(DISPATCH_X, DISPATCH_Y);
   pass.end();
-  commandEncoder.copyBufferToBuffer(
-    resultsBuffer,
-    0,
-    readbackBuffer,
-    0,
-    RESULTS_SIZE
-  );
+  commandEncoder.copyBufferToBuffer(resultsBuffer, 0, readbackBuffer, 0, RESULTS_SIZE);
+  commandEncoder.copyBufferToBuffer(debugBuffer, 0, debugReadbackBuffer, 0, DEBUG_SIZE);
   device.queue.submit([commandEncoder.finish()]);
   await device.queue.onSubmittedWorkDone();
 
   await readbackBuffer.mapAsync(GPUMapMode.READ);
-  const resultData = new Uint32Array(
-    readbackBuffer.getMappedRange().slice(0)
-  );
+  const resultData = new Uint32Array(readbackBuffer.getMappedRange().slice(0));
   readbackBuffer.unmap();
-  return resultData;
-}
+
+  await debugReadbackBuffer.mapAsync(GPUMapMode.READ);
+  const debugData = new Uint32Array(debugReadbackBuffer.getMappedRange().slice(0));
+  debugReadbackBuffer.unmap();
+
+  return { results: resultData, debug: debugData };
+};
 
 // ── CPU verification ──────────────────────────────────────────────────
 function verifyKeyAddress(
@@ -445,17 +490,17 @@ process.on("SIGINT", () => {
 console.log(`Mining started. Press Ctrl+C to stop.\n`);
 
 while (!stopping) {
-  const resultData = await runOneDispatch(currentOffset);
+  const { results: resultData } = await runOneDispatch(currentOffset);
   const found = resultData[13] === 1;
 
   if (found) {
     const keyLimbs = resultData.slice(5, 13);
     const keyHex = limbsToHex(Array.from(keyLimbs));
-    const { address: cpuAddress, valid } = verifyKeyAddress(keyHex);
+    const { address: minedAddress, valid } = verifyKeyAddress(keyHex);
 
     if (valid) {
-      const addrBigInt = BigInt(cpuAddress);
-      const zeros = countLeadingZeroHex(cpuAddress);
+      const addrBigInt = BigInt(minedAddress);
+      const zeros = countLeadingZeroHex(minedAddress);
 
       if (addrBigInt < bestAddress) {
         bestAddress = addrBigInt;
@@ -463,7 +508,7 @@ while (!stopping) {
         totalKeys = currentOffset - resumedOffset + ITEMS_PER_DISPATCH;
         const entry: ResultEntry = {
           privateKey: keyHex,
-          address: cpuAddress,
+          address: minedAddress,
           leadingZeros: zeros,
           foundAt: new Date().toISOString(),
           totalKeysAtDiscovery: resumedKeys + totalKeys,
@@ -485,7 +530,7 @@ while (!stopping) {
           1000
         ).toFixed(0);
         console.log(
-          `\n  NEW BEST: ${cpuAddress} (${zeros} leading zeros, ${elapsed}s)`
+          `\n  NEW BEST: ${minedAddress} (${zeros} leading zeros, ${elapsed}s)`
         );
         console.log(`  key: ${keyHex}`);
 
